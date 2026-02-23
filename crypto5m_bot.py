@@ -2,7 +2,7 @@
 Polymarket 5-Minute Crypto Market Bot
 Monitors BTC/ETH/SOL/XRP up-or-down 5-minute markets with three strategies:
   1. Long Arbitrage  — buy YES + NO for total < 1.0 - fees
-  2. Last-15s Snipe  — buy highest-probability side in final 15 seconds
+  2. Last-15s Snipe  — buy highest-probability side in final 15 seconds (Probabilistic)
   3. Mispriced Order — find order-book outliers far below cluster price AND verify instant liquidation
 
 Public APIs only — no authentication, no live trading. Pure paper simulation.
@@ -288,9 +288,6 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
 # Known 5-minute crypto market prefixes.
-# slug pattern : {prefix}-updown-5m-{start_ts}
-# series_slug  : {prefix}-up-or-down-5m  (used as fallback discovery)
-# Outcomes are "Up" / "Down" (index 0 = Up, index 1 = Down)
 CRYPTO_MARKETS = {
     "BTC": {"prefix": "btc", "series_slug": "btc-up-or-down-5m", "emoji": "₿", "color": "#f59e0b"},
     "ETH": {"prefix": "eth", "series_slug": "eth-up-or-down-5m", "emoji": "Ξ", "color": "#0ea5e9"},
@@ -331,21 +328,21 @@ DEFAULT_PARAMS = {
 def init_state():
     defaults = {
         "running": False,
-        "market_data": {},          # crypto -> full market data dict
-        "orderbooks": {},           # crypto -> {yes: ob, no: ob}
+        "market_data": {},          
+        "orderbooks": {},           
         "opportunities": deque(maxlen=200),
         "trade_history": [],
-        "liquidation_history": [],  # Tracks guaranteed liquidations
+        "liquidation_history": [],  # Tracks guaranteed liquidations and resolutions
         "pnl_series": [],
         "logs": deque(maxlen=200),
         "total_pnl": 0.0,
-        "bankroll": DEFAULT_PARAMS["starting_bankroll"], # Initialize bankroll tracker
+        "bankroll": DEFAULT_PARAMS["starting_bankroll"], 
         "total_trades": 0,
         "total_opps": 0,
         "session_start": time.time(),
         "last_scan_ts": 0.0,
-        "current_period_start": 0,  # the start_ts being monitored
-        "period_transitions": 0,    # how many 5-min periods have been tracked
+        "current_period_start": 0,  
+        "period_transitions": 0,    
         "strategy_stats": {
             "arb": {"opps": 0, "trades": 0, "pnl": 0.0},
             "snipe": {"opps": 0, "trades": 0, "pnl": 0.0},
@@ -662,7 +659,7 @@ def check_arb_strategy(crypto: str, yes_ob: dict, no_ob: dict, p: dict) -> dict 
 
 
 # ─────────────────────────────────────────────
-# STRATEGY 2 — LAST-15s SNIPE
+# STRATEGY 2 — LAST-15s SNIPE (High Conviction only)
 # ─────────────────────────────────────────────
 def check_snipe_strategy(
     crypto: str, yes_ob: dict, no_ob: dict,
@@ -678,7 +675,8 @@ def check_snipe_strategy(
     candidates = []
     fees = p["clob_fee_pct"] + p["gas_merge_usd"] / p["max_trade_usd"] + p["swap_spread_pct"] + p["buffer_bps"] / 10_000
 
-    if yes_ask is not None and yes_ask > 0:
+    # Only target tokens highly likely to win (priced > 70 cents)
+    if yes_ask is not None and yes_ask > 0.70:
         edge_yes = 1.0 - yes_ask - fees
         if edge_yes >= p["snipe_threshold"]:
             candidates.append({
@@ -686,7 +684,7 @@ def check_snipe_strategy(
                 "edge": edge_yes, "confidence": yes_ask,
             })
 
-    if no_ask is not None and no_ask > 0:
+    if no_ask is not None and no_ask > 0.70:
         edge_no = 1.0 - no_ask - fees
         if edge_no >= p["snipe_threshold"]:
             candidates.append({
@@ -765,7 +763,6 @@ def check_mispriced_strategy(
         mispx = find_mispriced_orders(asks, p["mispriced_ratio"], p["mispriced_min_size"])
 
         for m in mispx:
-            # Safely parse and sort bids (highest bid first)
             parsed_bids = []
             for b in bids:
                 try:
@@ -778,7 +775,6 @@ def check_mispriced_strategy(
             total_sell_value = 0.0
             target_shares = m["size"]
             
-            # Find guaranteed buyers for the mispriced shares
             for b in sorted_bids:
                 b_price = b["price"]
                 b_size = b["size"]
@@ -792,7 +788,6 @@ def check_mispriced_strategy(
                     if fillable_shares >= target_shares:
                         break
                         
-            # Only trigger an opportunity if we have verified liquidity to instantly dump
             if fillable_shares > 0:
                 avg_sell_price = total_sell_value / fillable_shares
                 
@@ -800,10 +795,10 @@ def check_mispriced_strategy(
                     "strategy":    "mispriced",
                     "crypto":      crypto,
                     "token":       token_label,
-                    "price":       m["price"],         # Our buy price
-                    "size":        fillable_shares,    # Capped at available matching bids
+                    "price":       m["price"],         
+                    "size":        fillable_shares,    
                     "cluster_price": m["cluster_price"],
-                    "liquidation_price": avg_sell_price, # The guaranteed sell price
+                    "liquidation_price": avg_sell_price, 
                     "discount_pct":  m["discount_pct"],
                     "est_profit":    avg_sell_price - m["price"],
                     "label": (
@@ -825,11 +820,16 @@ def simulate_trade(opp: dict, p: dict) -> dict:
     if current_bankroll <= 0:
         return {"status": "rejected", "reason": "Bankroll depleted"}
 
+    # Calculate trade size based on risk percentage
     intended_size = current_bankroll * (p.get("trade_risk_pct", 10.0) / 100.0)
-    size = max(p["min_trade_usd"], min(intended_size, p["max_trade_usd"], current_bankroll))
+    
+    # Strictly cap size to current_bankroll and max_trade limits. 
+    # This guarantees we CANNOT spend more cash than available.
+    size = min(intended_size, p["max_trade_usd"], current_bankroll)
 
-    if size > current_bankroll:
-         return {"status": "rejected", "reason": f"Insufficient funds"}
+    # Reject if we don't even have enough for the minimum trade
+    if size < p["min_trade_usd"]:
+         return {"status": "rejected", "reason": f"Insufficient funds for min trade (Need ${p['min_trade_usd']:.2f}, Have ${current_bankroll:.2f})"}
 
     slip   = random.uniform(0, p["slippage_pct"] / 100)
     fill   = random.uniform(0.75, 1.0) 
@@ -843,10 +843,11 @@ def simulate_trade(opp: dict, p: dict) -> dict:
         net      = gross - p["gas_merge_usd"]
         return {
             "status": "filled", "strategy": "arb",
-            "crypto": opp["crypto"],
+            "crypto": opp["crypto"], "token": "YES+NO",
             "size_usd": size * fill,
             "shares": shares,
-            "cost_per": cost_per,
+            "buy_price": cost_per,
+            "sell_price": 1.00,
             "gross_pnl": gross,
             "net_pnl": net,
             "edge_pct": opp["net_edge"] * 100,
@@ -856,15 +857,30 @@ def simulate_trade(opp: dict, p: dict) -> dict:
         cost = opp["price"] + slip
         if cost >= 1.0:
             return {"status": "rejected", "reason": "cost >= 1.0"}
-        shares   = (size * fill) / cost
-        gross    = shares * (1.0 - cost)
-        net      = gross - p["gas_merge_usd"] / 2
+            
+        shares = (size * fill) / cost
+        
+        # PROBABILISTIC RESOLUTION:
+        # A token costing $0.85 has an 85% chance of actually winning.
+        # If it loses, it drops to $0.00 and you lose the entire investment.
+        is_winner = random.random() < cost
+        
+        if is_winner:
+            gross = shares * (1.0 - cost)
+            sell_price = 1.00
+        else:
+            gross = - (shares * cost) # Total loss of capital
+            sell_price = 0.00
+            
+        net = gross - p["gas_merge_usd"] / 2
+        
         return {
             "status": "filled", "strategy": "snipe",
             "crypto": opp["crypto"], "token": opp["token"],
-            "size_usd": size * fill,
+            "size_usd": shares * cost,
             "shares": shares,
-            "cost": cost,
+            "buy_price": cost,
+            "sell_price": sell_price,
             "gross_pnl": gross,
             "net_pnl": net,
             "edge_pct": opp["edge"] * 100,
@@ -1025,8 +1041,8 @@ def run_scan():
 
             st.session_state.trade_history.append(result)
             
-            # Record explicit liquidation if mispriced
-            if result["strategy"] == "mispriced":
+            # Record explicit liquidation or resolution for mispriced and snipe strategies
+            if result["strategy"] in ["mispriced", "snipe"]:
                 st.session_state.liquidation_history.append(result)
             
             st.session_state.total_trades += 1
@@ -1192,7 +1208,7 @@ with st.sidebar:
 
     st.markdown("**🎯 Strategies**")
     st.session_state["arb_enabled"]       = st.checkbox("1 — Long Arbitrage (UP+DOWN < 1)", value=True)
-    st.session_state["snipe_enabled"]     = st.checkbox("2 — Last-15s Snipe", value=True)
+    st.session_state["snipe_enabled"]     = st.checkbox("2 — Last-15s Snipe (Probabilistic)", value=True)
     st.session_state["mispriced_enabled"] = st.checkbox("3 — Verified Mispriced Flip", value=True)
 
     st.markdown("---")
@@ -1534,25 +1550,26 @@ with tab_history:
 # TAB 4 — LIQUIDATIONS
 # ─────────────────────────────────────────────
 with tab_liquidation:
-    st.markdown("#### Guaranteed Mispriced Liquidations")
+    st.markdown("#### Guaranteed Liquidations & Resolutions")
     st.markdown(
         '<p style="color:#7d8590;font-size:0.8rem;font-family:\'JetBrains Mono\'">'
-        'Records of mispriced trades that were instantly sold back into active bids for a guaranteed flip profit.</p>',
+        'Records of mispriced trades (flipped instantly to buyers) and Snipe trades (held to $1.00 or $0.00 resolution).</p>',
         unsafe_allow_html=True
     )
 
     if not st.session_state.liquidation_history:
         st.markdown(
-            '<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No instant liquidations executed yet.</p>',
+            '<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No liquidations/resolutions executed yet.</p>',
             unsafe_allow_html=True
         )
     else:
         liq_df = pd.DataFrame([
             {
                 "Time":        t.get("ts", ""),
+                "Strategy":    t.get("strategy", "").upper(),
                 "Crypto":      t.get("crypto", ""),
                 "Token":       t.get("token", ""),
-                "Shares Dumped": f"{t.get('shares', 0):.0f}",
+                "Shares":      f"{t.get('shares', 0):.2f}",
                 "Buy Price":   f"${t.get('buy_price', 0):.3f}",
                 "Sell Price":  f"${t.get('sell_price', 0):.3f}",
                 "Gross PnL":   f"${t.get('gross_pnl', 0):+.2f}",
@@ -1561,7 +1578,6 @@ with tab_liquidation:
             for t in reversed(st.session_state.liquidation_history[-100:])
         ])
         
-        # Highlight profitable rows via streamlit pandas styling
         def color_profit(val):
             color = '#00ff88' if '+' in str(val) else '#ff4444' if '−' in str(val) or '-' in str(val) else '#e6edf3'
             return f'color: {color}'
@@ -1602,10 +1618,11 @@ with tab_theory:
 
         ---
 
-        ### Strategy 2 — Last-15s Snipe
+        ### Strategy 2 — Last-15s Snipe (Probabilistic)
 
-        In the final 15 seconds, the outcome is nearly certain.
-        If someone left a stale limit order at a discount, you can buy the winning side cheaply:
+        In the final 15 seconds, the outcome is highly probable.
+        The bot targets tokens priced > $0.70.
+        It simulates holding to resolution: A token priced at $0.85 has an 85% chance of returning $1.00, and a 15% chance of returning $0.00.
 
         ```
         edge = 1.0 - best_ask_of_likely_winner - fees
