@@ -1618,32 +1618,115 @@ with tab_history:
 # TAB 4 — THEORY
 # ─────────────────────────────────────────────
 with tab_theory:
-    st.markdown("""
-## How the 5-Minute Crypto Bot Works
+    st.markdown(
+        """
+        ## How the 5-Minute Crypto Bot Works
 
-### Market Structure
+        ### Market Structure
 
-Polymarket creates a new **up-or-down** binary market for BTC, ETH, SOL, and XRP every
-5 minutes.  Each market has exactly two outcomes:
+        Polymarket creates a new **up-or-down** binary market for BTC, ETH, SOL, and XRP every
+        5 minutes.  Each market has exactly two outcomes:
 
-| Token | Resolves to $1.00 if… | Resolves to $0.00 if… |
-|-------|------------------------|------------------------|
-| **YES** | crypto price is higher at close | crypto price is same or lower |
-| **NO** | crypto price is same/lower at close | crypto price is higher |
+        | Token | Resolves to $1.00 if… | Resolves to $0.00 if… |
+        |-------|------------------------|------------------------|
+        | **YES** | crypto price is higher at close | crypto price is same or lower |
+        | **NO** | crypto price is same/lower at close | crypto price is higher |
 
-Markets are named `{crypto}-updown-5m-{start_unix_timestamp}` where the timestamp is
-the UNIX epoch at which the 5-minute window **opens**.
+        Markets are named `{crypto}-updown-5m-{start_unix_timestamp}` where the timestamp is
+        the UNIX epoch at which the 5-minute window **opens**.
 
-### Market Discovery Algorithm
+        ### Market Discovery Algorithm
 
-```python
-import time
+        ```python
+        import time
 
-def get_current_slug(crypto_prefix):
-    # Floor current timestamp to nearest 5-minute boundary
-    start_ts = (int(time.time()) // 300) * 300
-    return f"{crypto_prefix}-updown-5m-{start_ts}"
+        def get_current_slug(crypto_prefix):
+            # Floor current timestamp to nearest 5-minute boundary
+            start_ts = (int(time.time()) // 300) * 300
+            return f"{crypto_prefix}-updown-5m-{start_ts}"
 
-# Next market = start_ts + 300 (5 minutes)
-def get_next_slug(crypto_prefix, current_start_ts):
-    return f"{crypto_prefix}-updown-5m-{current_start_ts + 300}"
+        # Next market = start_ts + 300 (5 minutes)
+        def get_next_slug(crypto_prefix, current_start_ts):
+            return f"{crypto_prefix}-updown-5m-{current_start_ts + 300}"
+        ```
+
+        The bot continuously monitors the current period and **auto-rotates** when a new
+        5-minute boundary is crossed.
+
+        ---
+
+        ### Strategy 1 — Long Arbitrage
+
+        The $1.00 invariant: `1 YES + 1 NO = $1.00` at resolution.
+
+        If you can buy both sides for less than $1.00 minus all costs, you lock in risk-free profit:
+
+        ```
+        net_edge = 1.0 - (best_YES_ask + best_NO_ask) - total_fees
+        total_fees = CLOB_fee×2 + gas/trade_size + swap_spread + safety_buffer
+        ```
+
+        **Example**: YES ask = 0.48, NO ask = 0.49, total = 0.97.
+        With fees ~0.003, net_edge ≈ 0.027 (2.7 cents per $1 invested).
+
+        ---
+
+        ### Strategy 2 — Last-15s Snipe
+
+        In the final 15 seconds, the outcome is nearly certain (price is 90%+).
+        If someone left a stale limit order at a discount, you can buy the winning side cheaply:
+
+        ```
+        edge = 1.0 - best_ask_of_likely_winner - fees
+        ```
+
+        **Example**: BTC is clearly up (+1.8% in the 5-min window). YES asks at 0.94.
+        Edge = 1.0 - 0.94 - 0.003 ≈ 5.7 cents profit per share at resolution.
+
+        ---
+
+        ### Strategy 3 — Mispriced Order Detection
+
+        Scan the entire order book for asks far below the cluster:
+
+        ```
+        cluster_price = price level with maximum total volume
+        flag if: ask_price ≤ cluster_price × mispriced_ratio
+                 AND ask_size ≥ minimum_size
+        ```
+
+        **Example**: NO asks cluster at $0.33 (YES at 67%).
+        One seller placed a NO ask at $0.04 (error or stale order).
+        Buy it at $0.04; fair value is $0.33 → instant profit of $0.29/share.
+
+        ---
+
+        ### Cost Model
+
+        | Component | Value | Notes |
+        |-----------|-------|-------|
+        | CLOB fee | 0.075% per leg | Charged on each buy |
+        | Gas/merge | $0.50 flat | On-chain bundle merge |
+        | Swap spread | 0.02% | USDC↔USDC.e conversion |
+        | Safety buffer | 10 bps | Slippage cushion |
+        | **Total** | ~0.3% + $0.50 | Scales with trade size |
+        """
+    )
+
+
+# ─────────────────────────────────────────────
+# ──  S C A N   L O O P  ──
+# ─────────────────────────────────────────────
+if st.session_state.running:
+    run_scan()
+    interval = int(st.session_state.refresh_interval)
+    time.sleep(interval)
+    st.rerun()
+elif not st.session_state.market_data:
+    # Even when paused, pre-load market data once for the monitor view
+    period_start = get_period_start()
+    if period_start != st.session_state.current_period_start:
+        st.session_state.current_period_start = period_start
+        with st.spinner("Loading market data…"):
+            refresh_market_data(period_start)
+        st.rerun()
