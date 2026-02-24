@@ -2,7 +2,7 @@
 Polymarket 5-Minute Crypto Market Bot
 Monitors BTC/ETH/SOL/XRP up-or-down 5-minute markets with three strategies:
   1. Long Arbitrage  — buy YES + NO for total < 1.0 - fees
-  2. Last-15s Snipe  — buy highest-probability side in final 15 seconds (Consistent Probabilistic)
+  2. Late-Window Snipe — buy highest-probability side near close and wait for REAL API ORACLE resolution
   3. Mispriced Order — find order-book outliers far below cluster price AND verify instant liquidation
 
 Public APIs only — no authentication, no live trading. Pure paper simulation.
@@ -309,7 +309,7 @@ DEFAULT_PARAMS = {
     "buffer_bps":        10,        # safety buffer bps
     # Thresholds
     "arb_threshold_bps": 20,        # min net edge for arb strategy (bps)
-    "snipe_threshold":   0.05,      # min edge for last-15s snipe (per share)
+    "snipe_threshold":   0.05,      # min edge for late-window snipe (per share)
     "snipe_min_price":   0.70,      # min probability/price to target for snipe
     "mispriced_ratio":   0.50,      # ask must be ≤ this fraction of cluster to flag
     "mispriced_min_size":10.0,      # min order size to flag (USD)
@@ -632,7 +632,7 @@ def check_arb_strategy(crypto: str, yes_ob: dict, no_ob: dict, p: dict) -> dict 
 
 
 # ─────────────────────────────────────────────
-# STRATEGY 2 — LAST-15s SNIPE (High Conviction only)
+# STRATEGY 2 — LATE-WINDOW SNIPE (High Conviction only)
 # ─────────────────────────────────────────────
 def check_snipe_strategy(
     crypto: str, slug: str, yes_ob: dict, no_ob: dict,
@@ -1120,9 +1120,10 @@ with st.sidebar:
 
     st.markdown("---")
     st.session_state.refresh_interval = st.slider("Refresh interval (s)", 2, 30, int(st.session_state.refresh_interval), step=1)
-    st.session_state.last_15s_window = st.slider("Snipe window (s before close)", 5, 30, int(st.session_state.last_15s_window), step=1)
     
-    # ── NEW SLIDER HERE ──
+    # ── UPDATED MAX SLIDER TO 60 SECONDS (1 MINUTE) ──
+    st.session_state.last_15s_window = st.slider("Snipe window (s before close)", 5, 60, int(st.session_state.last_15s_window), step=1)
+    
     st.session_state.snipe_min_price = st.slider("Snipe min price (> $X)", 0.50, 0.99, float(st.session_state.snipe_min_price), step=0.01)
 
     st.markdown("---")
@@ -1257,7 +1258,7 @@ with tab_opps:
     sc1, sc2, sc3 = st.columns(3)
 
     with sc1: st.markdown(f'<div class="metric-card"><div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px"><span class="badge badge-arb">LONG ARB</span></div><div class="metric-val">{ss["arb"]["opps"]}</div><div class="metric-label">opportunities</div><div style="font-size:0.75rem;color:#00ff88;margin-top:4px">{ss["arb"]["trades"]} trades · ${ss["arb"]["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
-    with sc2: st.markdown(f'<div class="metric-card"><div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px"><span class="badge badge-snipe">LAST-15s SNIPE</span></div><div class="metric-val warn">{ss["snipe"]["opps"]}</div><div class="metric-label">opportunities</div><div style="font-size:0.75rem;color:#f59e0b;margin-top:4px">{ss["snipe"]["trades"]} trades · ${ss["snipe"]["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
+    with sc2: st.markdown(f'<div class="metric-card"><div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px"><span class="badge badge-snipe">LATE-WINDOW SNIPE</span></div><div class="metric-val warn">{ss["snipe"]["opps"]}</div><div class="metric-label">opportunities</div><div style="font-size:0.75rem;color:#f59e0b;margin-top:4px">{ss["snipe"]["trades"]} trades · ${ss["snipe"]["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
     with sc3: st.markdown(f'<div class="metric-card"><div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px"><span class="badge badge-mispriced">MISPRICED</span></div><div class="metric-val purple">{ss["mispriced"]["opps"]}</div><div class="metric-label">opportunities</div><div style="font-size:0.75rem;color:#a78bfa;margin-top:4px">{ss["mispriced"]["trades"]} trades · ${ss["mispriced"]["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
 
     st.markdown("---")
@@ -1294,7 +1295,7 @@ with tab_history:
 
         st.markdown("**Strategy Breakdown**")
         bc1, bc2, bc3 = st.columns(3)
-        for col, (strat, color, label) in zip([bc1, bc2, bc3], [("arb", "#00ff88", "Long Arb"), ("snipe", "#f59e0b", "Last-15s Snipe"), ("mispriced", "#a78bfa", "Mispriced")]):
+        for col, (strat, color, label) in zip([bc1, bc2, bc3], [("arb", "#00ff88", "Long Arb"), ("snipe", "#f59e0b", "Late-Window Snipe"), ("mispriced", "#a78bfa", "Mispriced")]):
             strat_trades = [t for t in st.session_state.trade_history if t.get("strategy") == strat]
             s_pnl  = sum(t.get("net_pnl", 0) for t in strat_trades)
             s_wins = sum(1 for t in strat_trades if t.get("net_pnl", 0) > 0)
@@ -1332,8 +1333,8 @@ with tab_theory:
         ### Strategy 1 — Long Arbitrage
         The $1.00 invariant: `1 YES + 1 NO = $1.00` at resolution. If you can buy both sides for less than $1.00 minus all costs, you lock in risk-free profit.
 
-        ### Strategy 2 — Last-15s Snipe (Real API Verification)
-        In the final 15 seconds, the outcome is highly probable. The bot targets tokens priced above your set minimum (default > $0.70).
+        ### Strategy 2 — Late-Window Snipe (Real API Verification)
+        As the market approaches expiration, the outcome becomes highly probable. The bot targets tokens priced above your set minimum (default > $0.70) within the configurable time window.
         **Verification:** The bot deducts the cost from your bankroll, places the trade into a `PENDING` queue, and continuously polls the Polymarket API until the oracle officially closes the market and confirms the winning token. It then pays out exactly $1.00 or $0.00.
 
         ### Strategy 3 — Verified Mispriced Liquidation
