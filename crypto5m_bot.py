@@ -2,7 +2,7 @@
 Polymarket 5-Minute Crypto Market Bot
 Monitors BTC/ETH/SOL/XRP up-or-down 5-minute markets with three strategies:
   1. Long Arbitrage  — buy YES + NO for total < 1.0 - fees
-  2. Last-15s Snipe  — buy highest-probability side in final 15 seconds (Probabilistic)
+  2. Last-15s Snipe  — buy highest-probability side in final 15 seconds (Consistent Probabilistic)
   3. Mispriced Order — find order-book outliers far below cluster price AND verify instant liquidation
 
 Public APIs only — no authentication, no live trading. Pure paper simulation.
@@ -333,6 +333,7 @@ def init_state():
         "opportunities": deque(maxlen=200),
         "trade_history": [],
         "liquidation_history": [],  # Tracks guaranteed liquidations and resolutions
+        "market_resolutions": {},   # Stores the consistent true winner per 5m period
         "pnl_series": [],
         "logs": deque(maxlen=200),
         "total_pnl": 0.0,
@@ -860,10 +861,21 @@ def simulate_trade(opp: dict, p: dict) -> dict:
             
         shares = (size * fill) / cost
         
-        # PROBABILISTIC RESOLUTION:
-        # A token costing $0.85 has an 85% chance of actually winning.
-        # If it loses, it drops to $0.00 and you lose the entire investment.
-        is_winner = random.random() < cost
+        # --- FIX: CONSISTENT MARKET REALITY ---
+        # A 5-min market only resolves ONCE. We cannot have "SOL UP" lose at 00:19:47 
+        # and "SOL UP" win at 00:19:49. They must share the exact same outcome.
+        market_key = f"{opp['crypto']}_{st.session_state.current_period_start}"
+        
+        # If we haven't decided the final outcome of this specific 5-minute period yet, roll the dice NOW.
+        if market_key not in st.session_state.market_resolutions:
+            if random.random() < cost:
+                st.session_state.market_resolutions[market_key] = opp["token"] # This token is the true winner
+            else:
+                # The opposite token is the true winner
+                st.session_state.market_resolutions[market_key] = "DOWN" if opp["token"] == "UP" else "UP"
+                
+        # Check this trade against the universal truth for this 5-min window
+        is_winner = (opp["token"] == st.session_state.market_resolutions[market_key])
         
         if is_winner:
             gross = shares * (1.0 - cost)
@@ -984,6 +996,7 @@ def run_scan():
         st.session_state.period_transitions += 1
         st.session_state.market_data = {}
         st.session_state.orderbooks  = {}
+        st.session_state.market_resolutions = {} # Clear past resolutions for the new period
         refresh_market_data(now_start)
     else:
         if not st.session_state.market_data:
@@ -1168,6 +1181,7 @@ with st.sidebar:
                     st.session_state[k] = deque(maxlen=200)
             
             st.session_state.bankroll = st.session_state.starting_bankroll
+            st.session_state.market_resolutions = {}
 
             st.session_state.strategy_stats = {
                 "arb":       {"opps": 0, "trades": 0, "pnl": 0.0},
@@ -1623,6 +1637,7 @@ with tab_theory:
         In the final 15 seconds, the outcome is highly probable.
         The bot targets tokens priced > $0.70.
         It simulates holding to resolution: A token priced at $0.85 has an 85% chance of returning $1.00, and a 15% chance of returning $0.00.
+        (Note: The simulator establishes one "true winner" per 5-minute period so outcomes are mathematically consistent).
 
         ```
         edge = 1.0 - best_ask_of_likely_winner - fees
