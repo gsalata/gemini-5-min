@@ -2,7 +2,7 @@
 Polymarket 5-Minute Crypto Market Bot
 Monitors BTC/ETH/SOL/XRP up-or-down 5-minute markets with three strategies:
   1. Long Arbitrage  — buy YES + NO for total < 1.0 - fees
-  2. Last-15s Snipe  — buy highest-probability side in final 15 seconds (Consistent Probabilistic)
+  2. Last-15s Snipe  — buy highest-probability side and wait for REAL API ORACLE resolution
   3. Mispriced Order — find order-book outliers far below cluster price AND verify instant liquidation
 
 Public APIs only — no authentication, no live trading. Pure paper simulation.
@@ -332,8 +332,8 @@ def init_state():
         "orderbooks": {},           
         "opportunities": deque(maxlen=200),
         "trade_history": [],
-        "liquidation_history": [],  # Tracks guaranteed liquidations and resolutions
-        "market_resolutions": {},   # Stores the consistent true winner per 5m period
+        "pending_trades": [],       # Tracks Snipe trades waiting for real API resolution
+        "liquidation_history": [],  # Tracks guaranteed liquidations and API resolutions
         "pnl_series": [],
         "logs": deque(maxlen=200),
         "total_pnl": 0.0,
@@ -355,7 +355,6 @@ def init_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
-
 init_state()
 
 
@@ -366,29 +365,23 @@ def get_period_start(ts: float | None = None) -> int:
     t = int(ts if ts is not None else time.time())
     return (t // PERIOD_SECS) * PERIOD_SECS
 
-
 def get_period_end(start_ts: int) -> int:
     return start_ts + PERIOD_SECS
-
 
 def time_left_in_period(start_ts: int) -> float:
     end_ts = get_period_end(start_ts)
     return max(0.0, end_ts - time.time())
 
-
 def format_countdown(secs: float) -> str:
     s = int(secs)
     return f"{s // 60}:{s % 60:02d}"
-
 
 def period_elapsed_frac(start_ts: int) -> float:
     elapsed = time.time() - start_ts
     return min(1.0, max(0.0, elapsed / PERIOD_SECS))
 
-
 def get_slug(prefix: str, start_ts: int) -> str:
     return f"{prefix}-updown-5m-{start_ts}"
-
 
 def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
@@ -425,25 +418,19 @@ def _parse_market_record(m: dict, slug: str, start_ts: int) -> dict | None:
     outcomes = m.get("outcomes", [])
     clob_ids = m.get("clobTokenIds", [])
     if not isinstance(outcomes, list):
-        try:
-            outcomes = json.loads(outcomes)
-        except Exception:
-            return None
+        try: outcomes = json.loads(outcomes)
+        except Exception: return None
     if not isinstance(clob_ids, list):
-        try:
-            clob_ids = json.loads(clob_ids)
-        except Exception:
-            return None
+        try: clob_ids = json.loads(clob_ids)
+        except Exception: return None
 
     if len(clob_ids) < 2:
         return None
 
     prices = m.get("outcomePrices", "[]")
     if not isinstance(prices, list):
-        try:
-            prices = json.loads(prices)
-        except Exception:
-            prices = []
+        try: prices = json.loads(prices)
+        except Exception: prices = []
 
     return {
         "slug":       slug,
@@ -482,14 +469,7 @@ def fetch_5m_market(prefix: str, start_ts: int) -> dict | None:
     try:
         r = _http_get(
             f"{GAMMA_API}/events",
-            params={
-                "series_slug": series_slug,
-                "closed": "false",
-                "active": "true",
-                "order": "endDate",
-                "ascending": "true",
-                "limit": 1,
-            },
+            params={"series_slug": series_slug, "closed": "false", "active": "true", "order": "endDate", "ascending": "true", "limit": 1},
             timeout=8,
         )
         if r:
@@ -514,7 +494,7 @@ def fetch_5m_market(prefix: str, start_ts: int) -> dict | None:
                         actual_start = start_ts
                     return _parse_market_record(m, actual_slug, actual_start)
     except Exception as e:
-        log(f"[API] series fallback {series_slug}: {e}", "err")
+        pass
 
     return None
 
@@ -523,13 +503,7 @@ def fetch_next_5m_market(series_slug: str) -> dict | None:
     try:
         r = _http_get(
             f"{GAMMA_API}/events",
-            params={
-                "series_slug": series_slug,
-                "closed": "false",
-                "order": "endDate",
-                "ascending": "false",
-                "limit": 1,
-            },
+            params={"series_slug": series_slug, "closed": "false", "order": "endDate", "ascending": "false", "limit": 1},
             timeout=8,
         )
         if r:
@@ -542,8 +516,8 @@ def fetch_next_5m_market(series_slug: str) -> dict | None:
                     slug = m.get("slug", "")
                     start_ts = get_period_start()
                     return _parse_market_record(m, slug, start_ts)
-    except Exception as e:
-        log(f"[API] next market {series_slug}: {e}", "err")
+    except Exception:
+        pass
     return None
 
 
@@ -558,8 +532,7 @@ def fetch_orderbook(token_id: str) -> dict | None:
         asks = data.get("asks", data.get("sells", []))
         bids = data.get("bids", [])
         return {"asks": asks, "bids": bids}
-    except Exception as e:
-        log(f"[API] orderbook {token_id[:12]}…: {e}", "err")
+    except Exception:
         return None
 
 
@@ -582,8 +555,8 @@ def fetch_orderbooks_batch(token_ids: list[str]) -> dict[str, dict]:
                 result[tid] = {"asks": asks, "bids": bids}
             if result:
                 return result
-    except Exception as e:
-        log(f"[API] batch orderbooks failed ({e}), falling back to individual GETs", "warn")
+    except Exception:
+        pass
 
     result = {}
     for tid in token_ids:
@@ -604,7 +577,6 @@ def best_ask_price(ob: dict | None) -> float | None:
         return min(float(a["price"]) for a in asks)
     except Exception:
         return None
-
 
 def effective_buy_price(ob: dict | None) -> float | None:
     return best_ask_price(ob)
@@ -635,10 +607,8 @@ def check_arb_strategy(crypto: str, yes_ob: dict, no_ob: dict, p: dict) -> dict 
     yes_ask = effective_buy_price(yes_ob)
     no_ask  = effective_buy_price(no_ob)
 
-    if yes_ask is None or no_ask is None:
-        return None
-    if yes_ask <= 0 or no_ask <= 0:
-        return None
+    if yes_ask is None or no_ask is None: return None
+    if yes_ask <= 0 or no_ask <= 0: return None
 
     trade_size = (p["min_trade_usd"] + p["max_trade_usd"]) / 2
     raw_edge, net_edge = compute_arb_edge(yes_ask, no_ask, trade_size, p)
@@ -663,7 +633,7 @@ def check_arb_strategy(crypto: str, yes_ob: dict, no_ob: dict, p: dict) -> dict 
 # STRATEGY 2 — LAST-15s SNIPE (High Conviction only)
 # ─────────────────────────────────────────────
 def check_snipe_strategy(
-    crypto: str, yes_ob: dict, no_ob: dict,
+    crypto: str, slug: str, yes_ob: dict, no_ob: dict,
     time_left: float, p: dict
 ) -> dict | None:
     window = p["last_15s_window"]
@@ -676,22 +646,16 @@ def check_snipe_strategy(
     candidates = []
     fees = p["clob_fee_pct"] + p["gas_merge_usd"] / p["max_trade_usd"] + p["swap_spread_pct"] + p["buffer_bps"] / 10_000
 
-    # Only target tokens highly likely to win (priced > 70 cents)
+    # Target tokens highly likely to win (priced > 70 cents)
     if yes_ask is not None and yes_ask > 0.70:
         edge_yes = 1.0 - yes_ask - fees
         if edge_yes >= p["snipe_threshold"]:
-            candidates.append({
-                "token": "UP", "price": yes_ask,
-                "edge": edge_yes, "confidence": yes_ask,
-            })
+            candidates.append({"token": "UP", "price": yes_ask, "edge": edge_yes, "confidence": yes_ask})
 
     if no_ask is not None and no_ask > 0.70:
         edge_no = 1.0 - no_ask - fees
         if edge_no >= p["snipe_threshold"]:
-            candidates.append({
-                "token": "DOWN", "price": no_ask,
-                "edge": edge_no, "confidence": no_ask,
-            })
+            candidates.append({"token": "DOWN", "price": no_ask, "edge": edge_no, "confidence": no_ask})
 
     if not candidates:
         return None
@@ -701,6 +665,7 @@ def check_snipe_strategy(
     return {
         "strategy":    "snipe",
         "crypto":      crypto,
+        "slug":        slug, # Pass the slug so we can poll the API later
         "token":       best["token"],
         "price":       best["price"],
         "edge":        best["edge"],
@@ -716,16 +681,9 @@ def check_snipe_strategy(
 # STRATEGY 3 — MISPRICED ORDERS w/ LIQUIDATION CHECK
 # ─────────────────────────────────────────────
 def find_mispriced_orders(asks: list, ratio_threshold: float, min_size: float) -> list:
-    if not asks or len(asks) < 2:
-        return []
-
-    try:
-        entries = [(float(a["price"]), float(a["size"])) for a in asks]
-    except Exception:
-        return []
-
-    prices = [e[0] for e in entries]
-    sizes  = [e[1] for e in entries]
+    if not asks or len(asks) < 2: return []
+    try: entries = [(float(a["price"]), float(a["size"])) for a in asks]
+    except Exception: return []
 
     price_vol: dict[float, float] = {}
     for p, s in entries:
@@ -735,17 +693,13 @@ def find_mispriced_orders(asks: list, ratio_threshold: float, min_size: float) -
 
     mispriced = []
     for p_val, s_val in entries:
-        if s_val < min_size:
-            continue
+        if s_val < min_size: continue
         if p_val <= cluster_price * ratio_threshold and p_val < cluster_price - 0.10:
             discount = (cluster_price - p_val) / cluster_price
             mispriced.append({
-                "price":         p_val,
-                "size":          s_val,
-                "cluster_price": cluster_price,
-                "discount_pct":  discount * 100,
+                "price": p_val, "size": s_val, 
+                "cluster_price": cluster_price, "discount_pct": discount * 100,
             })
-
     return sorted(mispriced, key=lambda x: x["price"])
 
 
@@ -753,21 +707,16 @@ def check_mispriced_strategy(
     crypto: str, yes_ob: dict, no_ob: dict, p: dict
 ) -> list[dict]:
     opps = []
-
     for token_label, ob in [("UP", yes_ob), ("DOWN", no_ob)]:
-        if not ob:
-            continue
-            
+        if not ob: continue
         asks = ob.get("asks", [])
-        bids = ob.get("bids", []) # Retrieve bids to verify liquidation
+        bids = ob.get("bids", []) 
 
         mispx = find_mispriced_orders(asks, p["mispriced_ratio"], p["mispriced_min_size"])
-
         for m in mispx:
             parsed_bids = []
             for b in bids:
-                try:
-                    parsed_bids.append({"price": float(b["price"]), "size": float(b["size"])})
+                try: parsed_bids.append({"price": float(b["price"]), "size": float(b["size"])})
                 except Exception: pass
                 
             sorted_bids = sorted(parsed_bids, key=lambda x: x["price"], reverse=True)
@@ -777,38 +726,21 @@ def check_mispriced_strategy(
             target_shares = m["size"]
             
             for b in sorted_bids:
-                b_price = b["price"]
-                b_size = b["size"]
-                
-                # We only dump into a bid if it's strictly higher than our cost + a safety buffer
-                if b_price > m["price"] + 0.01:
-                    take_size = min(target_shares - fillable_shares, b_size)
+                if b["price"] > m["price"] + 0.01:
+                    take_size = min(target_shares - fillable_shares, b["size"])
                     fillable_shares += take_size
-                    total_sell_value += take_size * b_price
-                    
-                    if fillable_shares >= target_shares:
-                        break
+                    total_sell_value += take_size * b["price"]
+                    if fillable_shares >= target_shares: break
                         
             if fillable_shares > 0:
                 avg_sell_price = total_sell_value / fillable_shares
-                
                 opps.append({
-                    "strategy":    "mispriced",
-                    "crypto":      crypto,
-                    "token":       token_label,
-                    "price":       m["price"],         
-                    "size":        fillable_shares,    
-                    "cluster_price": m["cluster_price"],
-                    "liquidation_price": avg_sell_price, 
-                    "discount_pct":  m["discount_pct"],
-                    "est_profit":    avg_sell_price - m["price"],
-                    "label": (
-                        f"MISPRICED {crypto} {token_label} BUY@{m['price']:.3f} "
-                        f"& LIQUIDATE@{avg_sell_price:.3f} "
-                        f"(vol={fillable_shares:.0f})"
-                    ),
+                    "strategy": "mispriced", "crypto": crypto, "token": token_label,
+                    "price": m["price"], "size": fillable_shares,    
+                    "cluster_price": m["cluster_price"], "liquidation_price": avg_sell_price, 
+                    "discount_pct": m["discount_pct"], "est_profit": avg_sell_price - m["price"],
+                    "label": f"MISPRICED {crypto} {token_label} BUY@{m['price']:.3f} & LIQUIDATE@{avg_sell_price:.3f} (vol={fillable_shares:.0f})",
                 })
-
     return opps
 
 
@@ -821,14 +753,9 @@ def simulate_trade(opp: dict, p: dict) -> dict:
     if current_bankroll <= 0:
         return {"status": "rejected", "reason": "Bankroll depleted"}
 
-    # Calculate trade size based on risk percentage
     intended_size = current_bankroll * (p.get("trade_risk_pct", 10.0) / 100.0)
-    
-    # Strictly cap size to current_bankroll and max_trade limits. 
-    # This guarantees we CANNOT spend more cash than available.
     size = min(intended_size, p["max_trade_usd"], current_bankroll)
 
-    # Reject if we don't even have enough for the minimum trade
     if size < p["min_trade_usd"]:
          return {"status": "rejected", "reason": f"Insufficient funds for min trade (Need ${p['min_trade_usd']:.2f}, Have ${current_bankroll:.2f})"}
 
@@ -837,96 +764,114 @@ def simulate_trade(opp: dict, p: dict) -> dict:
 
     if opp["strategy"] == "arb":
         cost_per = opp["yes_price"] + opp["no_price"] + slip
-        if cost_per >= 1.0:
-            return {"status": "rejected", "reason": "slippage killed edge"}
+        if cost_per >= 1.0: return {"status": "rejected", "reason": "slippage killed edge"}
         shares   = (size * fill) / cost_per
         gross    = shares * (1.0 - cost_per)
         net      = gross - p["gas_merge_usd"]
         return {
-            "status": "filled", "strategy": "arb",
-            "crypto": opp["crypto"], "token": "YES+NO",
-            "size_usd": size * fill,
-            "shares": shares,
-            "buy_price": cost_per,
-            "sell_price": 1.00,
-            "gross_pnl": gross,
-            "net_pnl": net,
-            "edge_pct": opp["net_edge"] * 100,
+            "status": "filled", "strategy": "arb", "crypto": opp["crypto"], "token": "YES+NO",
+            "size_usd": size * fill, "shares": shares, "buy_price": cost_per, "sell_price": 1.00,
+            "gross_pnl": gross, "net_pnl": net, "edge_pct": opp["net_edge"] * 100,
         }
 
     elif opp["strategy"] == "snipe":
         cost = opp["price"] + slip
-        if cost >= 1.0:
-            return {"status": "rejected", "reason": "cost >= 1.0"}
+        if cost >= 1.0: return {"status": "rejected", "reason": "cost >= 1.0"}
             
         shares = (size * fill) / cost
+        total_cost_deduction = (shares * cost) + (p["gas_merge_usd"] / 2)
         
-        # --- FIX: CONSISTENT MARKET REALITY ---
-        # A 5-min market only resolves ONCE. We cannot have "SOL UP" lose at 00:19:47 
-        # and "SOL UP" win at 00:19:49. They must share the exact same outcome.
-        market_key = f"{opp['crypto']}_{st.session_state.current_period_start}"
-        
-        # If we haven't decided the final outcome of this specific 5-minute period yet, roll the dice NOW.
-        if market_key not in st.session_state.market_resolutions:
-            if random.random() < cost:
-                st.session_state.market_resolutions[market_key] = opp["token"] # This token is the true winner
-            else:
-                # The opposite token is the true winner
-                st.session_state.market_resolutions[market_key] = "DOWN" if opp["token"] == "UP" else "UP"
-                
-        # Check this trade against the universal truth for this 5-min window
-        is_winner = (opp["token"] == st.session_state.market_resolutions[market_key])
-        
-        if is_winner:
-            gross = shares * (1.0 - cost)
-            sell_price = 1.00
-        else:
-            gross = - (shares * cost) # Total loss of capital
-            sell_price = 0.00
-            
-        net = gross - p["gas_merge_usd"] / 2
+        # Deduct cost immediately from bankroll while we wait for Oracle to resolve
+        st.session_state.bankroll -= total_cost_deduction
         
         return {
-            "status": "filled", "strategy": "snipe",
-            "crypto": opp["crypto"], "token": opp["token"],
-            "size_usd": shares * cost,
-            "shares": shares,
-            "buy_price": cost,
-            "sell_price": sell_price,
-            "gross_pnl": gross,
-            "net_pnl": net,
-            "edge_pct": opp["edge"] * 100,
+            "status": "pending_resolution", # Put into holding pattern to wait for REAL API
+            "strategy": "snipe", "crypto": opp["crypto"], "slug": opp["slug"], "token": opp["token"],
+            "size_usd": shares * cost, "shares": shares, "buy_price": cost, 
+            "cost_deducted": total_cost_deduction, "edge_pct": opp["edge"] * 100,
         }
 
     elif opp["strategy"] == "mispriced":
         cost  = opp["price"] + slip
-        
-        # Calculate max shares we CAN buy with our intended trade size USD
         max_shares_we_can_buy = (size * fill) / cost
-        
-        # We strictly cap the traded shares to the fillable_shares found in the bids
         shares_executed = min(max_shares_we_can_buy, opp["size"])
         usd_cost = shares_executed * cost
         
-        # Instant sell to the bids we identified (applying slip to the sell side too)
         sell_price = opp["liquidation_price"] - slip
-        
         gross = shares_executed * (sell_price - cost)
         net   = gross - p["gas_merge_usd"] / 2 
         
         return {
-            "status": "filled", "strategy": "mispriced",
-            "crypto": opp["crypto"], "token": opp["token"],
-            "size_usd": usd_cost,
-            "shares": shares_executed,
-            "buy_price": cost,
-            "sell_price": sell_price,
-            "gross_pnl": gross,
-            "net_pnl": net,
-            "discount_pct": opp["discount_pct"],
+            "status": "filled", "strategy": "mispriced", "crypto": opp["crypto"], "token": opp["token"],
+            "size_usd": usd_cost, "shares": shares_executed, "buy_price": cost, "sell_price": sell_price,
+            "gross_pnl": gross, "net_pnl": net, "discount_pct": opp["discount_pct"],
         }
 
     return {"status": "unknown"}
+
+
+# ─────────────────────────────────────────────
+# REAL API ORACLE VERIFICATION
+# ─────────────────────────────────────────────
+def resolve_pending_trades():
+    """Polls Polymarket Gamma API to verify the actual real-world outcome of Snipe trades."""
+    if not st.session_state.pending_trades:
+        return
+        
+    still_pending = []
+    
+    for t in st.session_state.pending_trades:
+        slug = t.get("slug")
+        try:
+            r = requests.get(f"{GAMMA_API}/markets", params={"slug": slug}, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                m = data[0] if isinstance(data, list) else data
+                
+                prices = m.get("outcomePrices", "[]")
+                if isinstance(prices, str):
+                    try: prices = json.loads(prices)
+                    except: prices = []
+                
+                # Check if market has officially closed and prices settled to [1, 0] or [0, 1]
+                if m.get("closed") and len(prices) >= 2 and (float(prices[0]) == 1.0 or float(prices[1]) == 1.0):
+                    winning_token = "UP" if float(prices[0]) == 1.0 else "DOWN"
+                    is_winner = (t["token"] == winning_token)
+                    
+                    if is_winner:
+                        winnings = t["shares"] * 1.00
+                        t["sell_price"] = 1.00
+                        t["gross_pnl"] = winnings - (t["shares"] * t["buy_price"])
+                        t["net_pnl"] = winnings - t["cost_deducted"]
+                        
+                        # Add full $1.00 payout per share back into bankroll
+                        st.session_state.bankroll += winnings
+                        log(f"[RESOLVED WIN] {t['crypto']} {t['token']} hit $1.00! Bankroll +${winnings:.2f}", "arb")
+                    else:
+                        t["sell_price"] = 0.00
+                        t["gross_pnl"] = -(t["shares"] * t["buy_price"])
+                        t["net_pnl"] = -t["cost_deducted"]
+                        log(f"[RESOLVED LOSS] Oracle resolved against {t['crypto']} {t['token']}. Wiped to $0.00.", "err")
+                        
+                    t["status"] = "resolved"
+                    
+                    # Update global stats now that it's finalized
+                    st.session_state.total_pnl += t["net_pnl"]
+                    st.session_state.liquidation_history.append(t)
+                    st.session_state.trade_history.append(t)
+                    st.session_state.total_trades += 1
+                    st.session_state.pnl_series.append({"ts": datetime.now().strftime("%H:%M:%S"), "pnl": st.session_state.total_pnl})
+                    st.session_state.strategy_stats["snipe"]["trades"] += 1
+                    st.session_state.strategy_stats["snipe"]["pnl"] += t["net_pnl"]
+                else:
+                    # Market not settled yet, keep pending
+                    still_pending.append(t)
+            else:
+                still_pending.append(t)
+        except Exception as e:
+            still_pending.append(t)
+            
+    st.session_state.pending_trades = still_pending
 
 
 # ─────────────────────────────────────────────
@@ -944,9 +889,7 @@ def refresh_market_data(period_start: int):
                 st.session_state.market_data[sym] = md2
             elif sym in st.session_state.market_data:
                 st.session_state.market_data[sym]["closed"] = True
-
         time.sleep(0.15)
-
     _refresh_orderbooks_from_market_data()
 
 
@@ -954,20 +897,16 @@ def _refresh_orderbooks_from_market_data():
     token_map: dict[str, tuple[str, str]] = {} 
     for sym in CRYPTO_MARKETS:
         md = st.session_state.market_data.get(sym)
-        if not md or md.get("closed"):
-            continue
+        if not md or md.get("closed"): continue
         token_map[md["up_token"]]   = (sym, "yes")
         token_map[md["down_token"]] = (sym, "no")
 
-    if not token_map:
-        return
-
+    if not token_map: return
     books = fetch_orderbooks_batch(list(token_map.keys()))
 
     new_obs: dict[str, dict] = {}
     for tid, (sym, side) in token_map.items():
-        if sym not in new_obs:
-            new_obs[sym] = {}
+        if sym not in new_obs: new_obs[sym] = {}
         new_obs[sym][side] = books.get(tid)
 
     for sym, ob in new_obs.items():
@@ -984,25 +923,21 @@ def refresh_orderbooks_only():
 def run_scan():
     p = {k: st.session_state[k] for k in DEFAULT_PARAMS}
     now_start = get_period_start()
+    
+    # 1. Resolve any pending Snipes from previous rounds before spending new money
+    resolve_pending_trades()
 
     prev_start = st.session_state.current_period_start
     if now_start != prev_start:
-        log(
-            f"[PERIOD] New 5-min window: start={now_start} "
-            f"({datetime.fromtimestamp(now_start, tz=timezone.utc).strftime('%H:%M')} UTC)",
-            "arb",
-        )
+        log(f"[PERIOD] New 5-min window: start={now_start} ({datetime.fromtimestamp(now_start, tz=timezone.utc).strftime('%H:%M')} UTC)", "arb")
         st.session_state.current_period_start = now_start
         st.session_state.period_transitions += 1
         st.session_state.market_data = {}
         st.session_state.orderbooks  = {}
-        st.session_state.market_resolutions = {} # Clear past resolutions for the new period
         refresh_market_data(now_start)
     else:
-        if not st.session_state.market_data:
-            refresh_market_data(now_start)
-        else:
-            refresh_orderbooks_only()
+        if not st.session_state.market_data: refresh_market_data(now_start)
+        else: refresh_orderbooks_only()
 
     time_left = time_left_in_period(now_start)
     all_opps  = []
@@ -1012,8 +947,8 @@ def run_scan():
         yes_ob = ob.get("yes")
         no_ob  = ob.get("no")
 
-        if not yes_ob and not no_ob:
-            continue
+        if not yes_ob and not no_ob: continue
+        slug = st.session_state.market_data.get(sym, {}).get("slug", "")
 
         if st.session_state.get("arb_enabled", True):
             arb = check_arb_strategy(sym, yes_ob, no_ob, p)
@@ -1022,8 +957,8 @@ def run_scan():
                 log(arb["label"], "arb")
                 st.session_state.strategy_stats["arb"]["opps"] += 1
 
-        if st.session_state.get("snipe_enabled", True):
-            snipe = check_snipe_strategy(sym, yes_ob, no_ob, time_left, p)
+        if st.session_state.get("snipe_enabled", True) and slug:
+            snipe = check_snipe_strategy(sym, slug, yes_ob, no_ob, time_left, p)
             if snipe:
                 all_opps.append(snipe)
                 log(snipe["label"], "snipe")
@@ -1044,8 +979,10 @@ def run_scan():
         st.session_state.opportunities.appendleft(opp)
 
         result = simulate_trade(opp, p)
+        
+        # Immediate Executions (Arb and Mispriced)
         if result.get("status") == "filled":
-            result["ts"]     = opp["ts"]
+            result["ts"] = opp["ts"]
             result["time_left"] = time_left
             pnl = result.get("net_pnl", 0)
             
@@ -1053,25 +990,23 @@ def run_scan():
             st.session_state.total_pnl += pnl
 
             st.session_state.trade_history.append(result)
-            
-            # Record explicit liquidation or resolution for mispriced and snipe strategies
-            if result["strategy"] in ["mispriced", "snipe"]:
+            if result["strategy"] == "mispriced":
                 st.session_state.liquidation_history.append(result)
             
             st.session_state.total_trades += 1
-            st.session_state.pnl_series.append({
-                "ts":  result["ts"],
-                "pnl": st.session_state.total_pnl,
-            })
+            st.session_state.pnl_series.append({"ts": result["ts"], "pnl": st.session_state.total_pnl})
 
             strat = opp["strategy"]
             st.session_state.strategy_stats[strat]["trades"] += 1
             st.session_state.strategy_stats[strat]["pnl"]    += pnl
 
-            log(
-                f"[EXEC] {strat.upper()} {opp['crypto']} → PnL ${pnl:+.2f} | Bankroll: ${st.session_state.bankroll:.2f}",
-                "arb" if pnl > 0 else "err",
-            )
+            log(f"[EXEC] {strat.upper()} {opp['crypto']} → PnL ${pnl:+.2f} | Bankroll: ${st.session_state.bankroll:.2f}", "arb" if pnl > 0 else "err")
+            
+        # Snipe trades waiting for Oracle Verification
+        elif result.get("status") == "pending_resolution":
+            result["ts"] = opp["ts"]
+            st.session_state.pending_trades.append(result)
+            log(f"[PENDING] Snipe {opp['crypto']} cost ${result['cost_deducted']:.2f}. Waiting for API Resolution.", "warn")
 
     st.session_state.last_scan_ts = time.time()
 
@@ -1080,12 +1015,9 @@ def run_scan():
 # UI HELPERS
 # ─────────────────────────────────────────────
 def render_orderbook_html(ob: dict | None, token_label: str, max_rows=6) -> str:
-    if not ob:
-        return f'<div style="color:#7d8590;font-size:0.7rem">No {token_label} data</div>'
-
+    if not ob: return f'<div style="color:#7d8590;font-size:0.7rem">No {token_label} data</div>'
     asks = sorted(ob.get("asks", []), key=lambda x: float(x.get("price", 0)), reverse=True)
     bids = sorted(ob.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
-
     mispriced_prices = set()
     if asks and len(asks) >= 2:
         all_prices = [float(a["price"]) for a in asks]
@@ -1098,54 +1030,32 @@ def render_orderbook_html(ob: dict | None, token_label: str, max_rows=6) -> str:
                     mispriced_prices.add(float(a["price"]))
 
     html = f'<div style="font-size:0.65rem;color:#7d8590;margin-bottom:2px;font-family:\'JetBrains Mono\';">{token_label} ORDER BOOK</div>'
-
     for a in asks[:max_rows]:
         p_val = float(a.get("price", 0))
         s_val = float(a.get("size", 0))
         cls   = "ob-mispriced" if p_val in mispriced_prices else "ob-ask"
         star  = " ⚡" if p_val in mispriced_prices else ""
         bar_w = min(100, int(s_val / 500 * 100))
-        html += (
-            f'<div class="{cls} ob-row">'
-            f'<span style="color:#ff4444">{p_val:.3f}{star}</span>'
-            f'<span style="color:#7d8590">{s_val:,.0f}</span>'
-            f'<div style="width:{bar_w}px;height:3px;background:rgba(255,68,68,0.4);border-radius:2px"></div>'
-            f"</div>"
-        )
+        html += f'<div class="{cls} ob-row"><span style="color:#ff4444">{p_val:.3f}{star}</span><span style="color:#7d8590">{s_val:,.0f}</span><div style="width:{bar_w}px;height:3px;background:rgba(255,68,68,0.4);border-radius:2px"></div></div>'
 
-    if asks and bids:
-        html += '<div style="border-top:1px solid #21262d;margin:3px 0"></div>'
+    if asks and bids: html += '<div style="border-top:1px solid #21262d;margin:3px 0"></div>'
 
     for b in bids[:max_rows]:
         p_val = float(b.get("price", 0))
         s_val = float(b.get("size", 0))
         bar_w = min(100, int(s_val / 500 * 100))
-        html += (
-            f'<div class="ob-bid ob-row">'
-            f'<span style="color:#00ff88">{p_val:.3f}</span>'
-            f'<span style="color:#7d8590">{s_val:,.0f}</span>'
-            f'<div style="width:{bar_w}px;height:3px;background:rgba(0,255,136,0.4);border-radius:2px"></div>'
-            f"</div>"
-        )
+        html += f'<div class="ob-bid ob-row"><span style="color:#00ff88">{p_val:.3f}</span><span style="color:#7d8590">{s_val:,.0f}</span><div style="width:{bar_w}px;height:3px;background:rgba(0,255,136,0.4);border-radius:2px"></div></div>'
 
     return html
 
-
 def countdown_class(secs: float) -> str:
-    if secs <= 15:
-        return "urgent"
-    elif secs <= 60:
-        return "warn"
+    if secs <= 15: return "urgent"
+    elif secs <= 60: return "warn"
     return "ok"
-
 
 def pct_bar(frac: float, color: str = "#00ff88") -> str:
     pct = int(frac * 100)
-    return (
-        f'<div class="period-bar">'
-        f'<div class="period-fill" style="width:{pct}%;background:{color}"></div>'
-        f"</div>"
-    )
+    return f'<div class="period-bar"><div class="period-fill" style="width:{pct}%;background:{color}"></div></div>'
 
 
 # ─────────────────────────────────────────────
@@ -1165,29 +1075,17 @@ with st.sidebar:
             log("Scanner " + ("started" if st.session_state.running else "paused"))
     with col2:
         if st.button("↺ Reset All"):
-            for k in ["trade_history", "liquidation_history", "pnl_series", "total_pnl", "total_trades",
+            for k in ["trade_history", "liquidation_history", "pending_trades", "pnl_series", "total_pnl", "total_trades",
                       "total_opps", "logs", "opportunities", "market_data",
                       "orderbooks", "current_period_start", "period_transitions"]:
-                if k in ["trade_history", "liquidation_history", "pnl_series"]:
-                    st.session_state[k] = []
-                elif k in ["total_pnl", "total_trades", "total_opps",
-                           "current_period_start", "period_transitions"]:
-                    st.session_state[k] = 0
-                elif k in ["market_data", "orderbooks"]:
-                    st.session_state[k] = {}
-                elif k == "logs":
-                    st.session_state[k] = deque(maxlen=200)
-                elif k == "opportunities":
-                    st.session_state[k] = deque(maxlen=200)
+                if k in ["trade_history", "liquidation_history", "pending_trades", "pnl_series"]: st.session_state[k] = []
+                elif k in ["total_pnl", "total_trades", "total_opps", "current_period_start", "period_transitions"]: st.session_state[k] = 0
+                elif k in ["market_data", "orderbooks"]: st.session_state[k] = {}
+                elif k == "logs": st.session_state[k] = deque(maxlen=200)
+                elif k == "opportunities": st.session_state[k] = deque(maxlen=200)
             
             st.session_state.bankroll = st.session_state.starting_bankroll
-            st.session_state.market_resolutions = {}
-
-            st.session_state.strategy_stats = {
-                "arb":       {"opps": 0, "trades": 0, "pnl": 0.0},
-                "snipe":     {"opps": 0, "trades": 0, "pnl": 0.0},
-                "mispriced": {"opps": 0, "trades": 0, "pnl": 0.0},
-            }
+            st.session_state.strategy_stats = {"arb": {"opps": 0, "trades": 0, "pnl": 0.0}, "snipe": {"opps": 0, "trades": 0, "pnl": 0.0}, "mispriced": {"opps": 0, "trades": 0, "pnl": 0.0}}
             st.session_state.session_start = time.time()
             log("Session reset")
             st.rerun()
@@ -1195,23 +1093,15 @@ with st.sidebar:
     st.markdown("---")
     
     st.markdown("**🏦 Bankroll Management**")
-    st.session_state.starting_bankroll = st.number_input(
-        "Deposit Amount ($)",
-        min_value=10.0,
-        value=float(st.session_state.starting_bankroll),
-        step=50.0
-    )
-    st.session_state.trade_risk_pct = st.slider(
-        "Risk Per Trade (%)",
-        1.0, 100.0,
-        float(st.session_state.trade_risk_pct), step=1.0
-    )
+    st.session_state.starting_bankroll = st.number_input("Deposit Amount ($)", min_value=10.0, value=float(st.session_state.starting_bankroll), step=50.0)
+    st.session_state.trade_risk_pct = st.slider("Risk Per Trade (%)", 1.0, 100.0, float(st.session_state.trade_risk_pct), step=1.0)
     
     if st.button("💰 Deposit Funds"):
         st.session_state.bankroll = st.session_state.starting_bankroll
         st.session_state.total_pnl = 0.0
         st.session_state.trade_history = []
         st.session_state.liquidation_history = []
+        st.session_state.pending_trades = []
         st.session_state.pnl_series = []
         log(f"Bankroll topped off/reset to ${st.session_state.bankroll:.2f}")
         st.rerun()
@@ -1219,79 +1109,36 @@ with st.sidebar:
     st.metric("Live Bankroll", f"${st.session_state.bankroll:.2f}", f"{st.session_state.total_pnl:+.2f}")
     
     st.markdown("---")
-
     st.markdown("**🎯 Strategies**")
     st.session_state["arb_enabled"]       = st.checkbox("1 — Long Arbitrage (UP+DOWN < 1)", value=True)
-    st.session_state["snipe_enabled"]     = st.checkbox("2 — Last-15s Snipe (Probabilistic)", value=True)
+    st.session_state["snipe_enabled"]     = st.checkbox("2 — Snipe & Verify API Resolution", value=True)
     st.session_state["mispriced_enabled"] = st.checkbox("3 — Verified Mispriced Flip", value=True)
 
     st.markdown("---")
-
-    st.session_state.refresh_interval = st.slider(
-        "Refresh interval (s)", 2, 30,
-        int(st.session_state.refresh_interval), step=1
-    )
-
-    st.session_state.last_15s_window = st.slider(
-        "Snipe window (s before close)", 5, 30,
-        int(st.session_state.last_15s_window), step=1
-    )
+    st.session_state.refresh_interval = st.slider("Refresh interval (s)", 2, 30, int(st.session_state.refresh_interval), step=1)
+    st.session_state.last_15s_window = st.slider("Snipe window (s before close)", 5, 30, int(st.session_state.last_15s_window), step=1)
 
     st.markdown("---")
-
     with st.expander("⚙ Cost Model"):
-        st.session_state.arb_threshold_bps = st.slider(
-            "Min arb edge (bps)", 5, 100,
-            int(st.session_state.arb_threshold_bps), step=5
-        )
-        st.session_state.snipe_threshold = st.slider(
-            "Min snipe edge (¢)", 1, 20,
-            int(st.session_state.snipe_threshold * 100), step=1
-        ) / 100
-        st.session_state.mispriced_ratio = st.slider(
-            "Mispriced ratio (ask ≤ X × cluster)", 10, 70,
-            int(st.session_state.mispriced_ratio * 100), step=5
-        ) / 100
-        st.session_state.mispriced_min_size = st.slider(
-            "Mispriced min size ($)", 1, 100,
-            int(st.session_state.mispriced_min_size), step=1
-        )
-        st.session_state.clob_fee_pct = st.number_input(
-            "CLOB fee per leg", value=st.session_state.clob_fee_pct,
-            format="%.5f", step=0.0001
-        )
-        st.session_state.gas_merge_usd = st.number_input(
-            "Gas/merge cost (USD)", value=st.session_state.gas_merge_usd,
-            format="%.2f", step=0.1
-        )
+        st.session_state.arb_threshold_bps = st.slider("Min arb edge (bps)", 5, 100, int(st.session_state.arb_threshold_bps), step=5)
+        st.session_state.snipe_threshold = st.slider("Min snipe edge (¢)", 1, 20, int(st.session_state.snipe_threshold * 100), step=1) / 100
+        st.session_state.mispriced_ratio = st.slider("Mispriced ratio (ask ≤ X × cluster)", 10, 70, int(st.session_state.mispriced_ratio * 100), step=5) / 100
+        st.session_state.mispriced_min_size = st.slider("Mispriced min size ($)", 1, 100, int(st.session_state.mispriced_min_size), step=1)
+        st.session_state.clob_fee_pct = st.number_input("CLOB fee per leg", value=st.session_state.clob_fee_pct, format="%.5f", step=0.0001)
+        st.session_state.gas_merge_usd = st.number_input("Gas/merge cost (USD)", value=st.session_state.gas_merge_usd, format="%.2f", step=0.1)
 
     with st.expander("💰 Trade Constraints"):
-        st.session_state.min_trade_usd = st.slider(
-            "Min trade (USD)", 10, 500,
-            int(st.session_state.min_trade_usd), step=10
-        )
-        st.session_state.max_trade_usd = st.slider(
-            "Max trade (USD)", 100, 5000,
-            int(st.session_state.max_trade_usd), step=100
-        )
-        st.session_state.slippage_pct = st.slider(
-            "Slippage (%)", 0.0, 2.0,
-            float(st.session_state.slippage_pct), step=0.1
-        )
+        st.session_state.min_trade_usd = st.slider("Min trade (USD)", 10, 500, int(st.session_state.min_trade_usd), step=10)
+        st.session_state.max_trade_usd = st.slider("Max trade (USD)", 100, 5000, int(st.session_state.max_trade_usd), step=100)
+        st.session_state.slippage_pct = st.slider("Slippage (%)", 0.0, 2.0, float(st.session_state.slippage_pct), step=0.1)
 
     st.markdown("---")
-    st.markdown(
-        '<p style="font-size:0.65rem;color:#7d8590;font-family:\'JetBrains Mono\'">'
-        'Public APIs only — no keys, no live trading.<br>'
-        'Simulation only for educational use.</p>',
-        unsafe_allow_html=True
-    )
+    st.markdown('<p style="font-size:0.65rem;color:#7d8590;font-family:\'JetBrains Mono\'">Public APIs only — no keys, no live trading.<br>Simulation only for educational use.</p>', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
 # ──  M A I N   C O N T E N T  ──
 # ─────────────────────────────────────────────
-
 col_h1, col_h2 = st.columns([3, 1])
 with col_h1:
     st.markdown('<h1 class="hero-title">🔮 Crypto 5-Minute Bot</h1>', unsafe_allow_html=True)
@@ -1301,11 +1148,8 @@ with col_h2:
     status_txt = "SCANNING" if st.session_state.running else "PAUSED"
     st.markdown(
         f'<div style="text-align:right;padding-top:0.8rem;">'
-        f'<span class="status-dot {dot_color}"></span>'
-        f'<span style="font-family:\'JetBrains Mono\';font-size:0.8rem;color:#e6edf3">{status_txt}</span>'
-        f'<br><span style="font-size:0.65rem;color:#7d8590">{utc_now_str()}</span>'
-        f'</div>',
-        unsafe_allow_html=True
+        f'<span class="status-dot {dot_color}"></span><span style="font-family:\'JetBrains Mono\';font-size:0.8rem;color:#e6edf3">{status_txt}</span>'
+        f'<br><span style="font-size:0.65rem;color:#7d8590">{utc_now_str()}</span></div>', unsafe_allow_html=True
     )
 
 now_start    = get_period_start()
@@ -1316,7 +1160,7 @@ session_mins = (time.time() - st.session_state.session_start) / 60
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Live Bankroll", f"${st.session_state.bankroll:.2f}", f"{st.session_state.total_pnl:+.2f}")
 k2.metric("Trades",    st.session_state.total_trades)
-k3.metric("Opps Found", st.session_state.total_opps)
+k3.metric("Pending Snipes", len(st.session_state.pending_trades))
 k4.metric("Periods",   st.session_state.period_transitions)
 k5.metric("Time Left",  format_countdown(t_left))
 k6.metric("Session",    f"{session_mins:.0f}m")
@@ -1327,22 +1171,15 @@ bar_color = "#ff4444" if t_left <= 15 else ("#f59e0b" if t_left <= 60 else "#00f
 st.markdown(
     f'<div style="margin:0.3rem 0;font-family:\'JetBrains Mono\';font-size:0.72rem;color:#7d8590">'
     f'Current period: {period_dt} → {period_end_dt} UTC &nbsp;|&nbsp; '
-    f'<span class="countdown {countdown_class(t_left)}">{format_countdown(t_left)} remaining</span>'
-    f'</div>'
-    + pct_bar(elapsed_frac, bar_color),
+    f'<span class="countdown {countdown_class(t_left)}">{format_countdown(t_left)} remaining</span></div>' + pct_bar(elapsed_frac, bar_color),
     unsafe_allow_html=True
 )
 
 st.markdown("---")
 
 tab_monitor, tab_opps, tab_history, tab_liquidation, tab_theory = st.tabs([
-    "📡  Live Monitor",
-    "⚡  Opportunities",
-    "📋  Trade History",
-    "💧  Liquidations",
-    "📐  Theory",
+    "📡  Live Monitor", "⚡  Opportunities", "📋  Trade History", "💧  Liquidations & API Payoffs", "📐  Theory"
 ])
-
 
 # ─────────────────────────────────────────────
 # TAB 1 — LIVE MONITOR
@@ -1365,21 +1202,15 @@ with tab_monitor:
         if yes_ask and no_ask:
             p_vals = {k: st.session_state[k] for k in DEFAULT_PARAMS}
             _, net_edge = compute_arb_edge(yes_ask, no_ask, 500, p_vals)
-            if net_edge >= p_vals["arb_threshold_bps"] / 10_000:
-                alert_cls = "alert-arb"
-            elif t_left <= p_vals["last_15s_window"]:
-                alert_cls = "alert-snipe"
+            if net_edge >= p_vals["arb_threshold_bps"] / 10_000: alert_cls = "alert-arb"
+            elif t_left <= p_vals["last_15s_window"]: alert_cls = "alert-snipe"
 
         with col:
             color = info["color"]
             yes_price_disp = f"{yes_ask:.3f}" if yes_ask else "—"
             no_price_disp  = f"{no_ask:.3f}"  if no_ask  else "—"
             total_disp     = f"{total:.3f}"    if (yes_ask and no_ask) else "—"
-            arb_disp = (
-                f'<span style="color:#00ff88">ARB {((1-total)*100):.1f}¢</span>'
-                if (yes_ask and no_ask and total < 0.99) else
-                f'<span style="color:#7d8590">{total_disp}</span>'
-            )
+            arb_disp = f'<span style="color:#00ff88">ARB {((1-total)*100):.1f}¢</span>' if (yes_ask and no_ask and total < 0.99) else f'<span style="color:#7d8590">{total_disp}</span>'
 
             question_short = ""
             if md:
@@ -1391,35 +1222,22 @@ with tab_monitor:
             st.markdown(
                 f'<div class="crypto-card {alert_cls}">'
                 f'<div class="crypto-name" style="color:{color}">{info["emoji"]} {sym}</div>'
-                f'<div style="font-size:0.65rem;color:#7d8590;margin-bottom:0.5rem">'
-                f'{question_short or (period_dt + "→" + period_end_dt + " UTC")}</div>'
+                f'<div style="font-size:0.65rem;color:#7d8590;margin-bottom:0.5rem">{question_short or (period_dt + "→" + period_end_dt + " UTC")}</div>'
                 f'<table style="width:100%;font-family:\'JetBrains Mono\';font-size:0.75rem">'
-                f'<tr><td style="color:#7d8590">UP ask</td>'
-                f'<td style="text-align:right;color:#e6edf3">{yes_price_disp}</td></tr>'
-                f'<tr><td style="color:#7d8590">DOWN ask</td>'
-                f'<td style="text-align:right;color:#e6edf3">{no_price_disp}</td></tr>'
-                f'<tr><td style="color:#7d8590">UP+DOWN</td>'
-                f'<td style="text-align:right">{arb_disp}</td></tr>'
-                f'</table>'
-                f'</div>',
+                f'<tr><td style="color:#7d8590">UP ask</td><td style="text-align:right;color:#e6edf3">{yes_price_disp}</td></tr>'
+                f'<tr><td style="color:#7d8590">DOWN ask</td><td style="text-align:right;color:#e6edf3">{no_price_disp}</td></tr>'
+                f'<tr><td style="color:#7d8590">UP+DOWN</td><td style="text-align:right">{arb_disp}</td></tr></table></div>',
                 unsafe_allow_html=True
             )
-
-            with st.expander(f"{sym} UP (Yes) Book", expanded=False):
-                st.markdown(render_orderbook_html(yes_ob, "UP"), unsafe_allow_html=True)
-            with st.expander(f"{sym} DOWN (No) Book", expanded=False):
-                st.markdown(render_orderbook_html(no_ob, "DOWN"), unsafe_allow_html=True)
+            with st.expander(f"{sym} UP (Yes) Book", expanded=False): st.markdown(render_orderbook_html(yes_ob, "UP"), unsafe_allow_html=True)
+            with st.expander(f"{sym} DOWN (No) Book", expanded=False): st.markdown(render_orderbook_html(no_ob, "DOWN"), unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("**Activity Log**")
     log_html = ""
     for entry in list(st.session_state.logs)[:30]:
         cls = entry.get("level", "info")
-        log_html += (
-            f'<div class="log-entry {cls}">'
-            f'<span style="color:#7d8590">[{entry["ts"]}]</span> {entry["msg"]}'
-            f'</div>'
-        )
+        log_html += f'<div class="log-entry {cls}"><span style="color:#7d8590">[{entry["ts"]}]</span> {entry["msg"]}</div>'
     st.markdown(log_html or '<div style="color:#7d8590">No log entries yet.</div>', unsafe_allow_html=True)
 
 
@@ -1428,76 +1246,26 @@ with tab_monitor:
 # ─────────────────────────────────────────────
 with tab_opps:
     st.markdown("#### Detected Opportunities")
-
     ss = st.session_state.strategy_stats
     sc1, sc2, sc3 = st.columns(3)
 
-    with sc1:
-        st.markdown(
-            f'<div class="metric-card">'
-            f'<div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px">'
-            f'<span class="badge badge-arb">LONG ARB</span></div>'
-            f'<div class="metric-val">{ss["arb"]["opps"]}</div>'
-            f'<div class="metric-label">opportunities</div>'
-            f'<div style="font-size:0.75rem;color:#00ff88;margin-top:4px">'
-            f'{ss["arb"]["trades"]} trades · ${ss["arb"]["pnl"]:+.2f}</div>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-
-    with sc2:
-        st.markdown(
-            f'<div class="metric-card">'
-            f'<div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px">'
-            f'<span class="badge badge-snipe">LAST-15s SNIPE</span></div>'
-            f'<div class="metric-val warn">{ss["snipe"]["opps"]}</div>'
-            f'<div class="metric-label">opportunities</div>'
-            f'<div style="font-size:0.75rem;color:#f59e0b;margin-top:4px">'
-            f'{ss["snipe"]["trades"]} trades · ${ss["snipe"]["pnl"]:+.2f}</div>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-
-    with sc3:
-        st.markdown(
-            f'<div class="metric-card">'
-            f'<div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px">'
-            f'<span class="badge badge-mispriced">MISPRICED</span></div>'
-            f'<div class="metric-val purple">{ss["mispriced"]["opps"]}</div>'
-            f'<div class="metric-label">opportunities</div>'
-            f'<div style="font-size:0.75rem;color:#a78bfa;margin-top:4px">'
-            f'{ss["mispriced"]["trades"]} trades · ${ss["mispriced"]["pnl"]:+.2f}</div>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+    with sc1: st.markdown(f'<div class="metric-card"><div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px"><span class="badge badge-arb">LONG ARB</span></div><div class="metric-val">{ss["arb"]["opps"]}</div><div class="metric-label">opportunities</div><div style="font-size:0.75rem;color:#00ff88;margin-top:4px">{ss["arb"]["trades"]} trades · ${ss["arb"]["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
+    with sc2: st.markdown(f'<div class="metric-card"><div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px"><span class="badge badge-snipe">LAST-15s SNIPE</span></div><div class="metric-val warn">{ss["snipe"]["opps"]}</div><div class="metric-label">opportunities</div><div style="font-size:0.75rem;color:#f59e0b;margin-top:4px">{ss["snipe"]["trades"]} trades · ${ss["snipe"]["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
+    with sc3: st.markdown(f'<div class="metric-card"><div style="font-size:0.65rem;color:#7d8590;margin-bottom:4px"><span class="badge badge-mispriced">MISPRICED</span></div><div class="metric-val purple">{ss["mispriced"]["opps"]}</div><div class="metric-label">opportunities</div><div style="font-size:0.75rem;color:#a78bfa;margin-top:4px">{ss["mispriced"]["trades"]} trades · ${ss["mispriced"]["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
 
     st.markdown("---")
-
     opps_list = list(st.session_state.opportunities)
-    if not opps_list:
-        st.markdown('<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No opportunities detected yet. Start the scanner.</p>', unsafe_allow_html=True)
+    if not opps_list: st.markdown('<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No opportunities detected yet. Start the scanner.</p>', unsafe_allow_html=True)
     else:
         rows = []
         for opp in opps_list[:50]:
             strat = opp.get("strategy", "")
-            
-            row = {
-                "Time":     opp.get("ts", ""),
-                "Strategy": strat.upper(),
-                "Crypto":   opp.get("crypto", ""),
-                "Detail":   opp.get("label", "")[:90],
-                "T-left(s)": f"{opp.get('time_left', 0):.0f}s",
-            }
-            if strat == "arb":
-                row["Edge"] = f"{opp.get('net_edge', 0)*100:.2f}¢"
-            elif strat == "snipe":
-                row["Edge"] = f"{opp.get('edge', 0)*100:.1f}¢"
-            elif strat == "mispriced":
-                row["Edge"] = f"−{opp.get('discount_pct', 0):.0f}%"
+            row = {"Time": opp.get("ts", ""), "Strategy": strat.upper(), "Crypto": opp.get("crypto", ""), "Detail": opp.get("label", "")[:90], "T-left(s)": f"{opp.get('time_left', 0):.0f}s"}
+            if strat == "arb": row["Edge"] = f"{opp.get('net_edge', 0)*100:.2f}¢"
+            elif strat == "snipe": row["Edge"] = f"{opp.get('edge', 0)*100:.1f}¢"
+            elif strat == "mispriced": row["Edge"] = f"−{opp.get('discount_pct', 0):.0f}%"
             rows.append(row)
-
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 # ─────────────────────────────────────────────
@@ -1505,54 +1273,21 @@ with tab_opps:
 # ─────────────────────────────────────────────
 with tab_history:
     st.markdown("#### Paper Trade History")
-
-    if not st.session_state.trade_history:
-        st.markdown(
-            '<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No trades yet.</p>',
-            unsafe_allow_html=True
-        )
+    if not st.session_state.trade_history: st.markdown('<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No trades finalized yet.</p>', unsafe_allow_html=True)
     else:
         if len(st.session_state.pnl_series) > 1:
             pnl_df = pd.DataFrame(st.session_state.pnl_series)
             fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=pnl_df["ts"], y=pnl_df["pnl"],
-                mode="lines", name="Cumulative PnL",
-                line=dict(color="#00ff88", width=2),
-                fill="tozeroy",
-                fillcolor="rgba(0,255,136,0.05)",
-            ))
-            fig.update_layout(
-                paper_bgcolor="#090c10", plot_bgcolor="#0d1117",
-                font=dict(color="#e6edf3", family="JetBrains Mono"),
-                height=220, margin=dict(l=40, r=10, t=30, b=30),
-                xaxis=dict(showgrid=False, color="#7d8590"),
-                yaxis=dict(gridcolor="#21262d", color="#7d8590", tickprefix="$"),
-                title=dict(text="Cumulative PnL", font=dict(color="#e6edf3", size=13)),
-            )
+            fig.add_trace(go.Scatter(x=pnl_df["ts"], y=pnl_df["pnl"], mode="lines", name="Cumulative PnL", line=dict(color="#00ff88", width=2), fill="tozeroy", fillcolor="rgba(0,255,136,0.05)"))
+            fig.update_layout(paper_bgcolor="#090c10", plot_bgcolor="#0d1117", font=dict(color="#e6edf3", family="JetBrains Mono"), height=220, margin=dict(l=40, r=10, t=30, b=30), xaxis=dict(showgrid=False, color="#7d8590"), yaxis=dict(gridcolor="#21262d", color="#7d8590", tickprefix="$"), title=dict(text="Cumulative PnL", font=dict(color="#e6edf3", size=13)))
             st.plotly_chart(fig, use_container_width=True)
 
-        trades_df = pd.DataFrame([
-            {
-                "Time":        t.get("ts", ""),
-                "Strategy":    t.get("strategy", "").upper(),
-                "Crypto":      t.get("crypto", ""),
-                "Token":       t.get("token", "PAIR"),
-                "Size($)":     f"{t.get('size_usd', 0):.0f}",
-                "Net PnL($)":  f"{t.get('net_pnl', 0):+.3f}",
-            }
-            for t in reversed(st.session_state.trade_history[-100:])
-        ])
+        trades_df = pd.DataFrame([{"Time": t.get("ts", ""), "Strategy": t.get("strategy", "").upper(), "Crypto": t.get("crypto", ""), "Token": t.get("token", "PAIR"), "Size($)": f"{t.get('size_usd', t.get('cost_deducted', 0)):.0f}", "Net PnL($)": f"{t.get('net_pnl', 0):+.3f}"} for t in reversed(st.session_state.trade_history[-100:])])
         st.dataframe(trades_df, use_container_width=True, hide_index=True)
 
         st.markdown("**Strategy Breakdown**")
         bc1, bc2, bc3 = st.columns(3)
-        strategies = [
-            ("arb",       "#00ff88", "Long Arb"),
-            ("snipe",     "#f59e0b", "Last-15s Snipe"),
-            ("mispriced", "#a78bfa", "Mispriced"),
-        ]
-        for col, (strat, color, label) in zip([bc1, bc2, bc3], strategies):
+        for col, (strat, color, label) in zip([bc1, bc2, bc3], [("arb", "#00ff88", "Long Arb"), ("snipe", "#f59e0b", "Last-15s Snipe"), ("mispriced", "#a78bfa", "Mispriced")]):
             strat_trades = [t for t in st.session_state.trade_history if t.get("strategy") == strat]
             s_pnl  = sum(t.get("net_pnl", 0) for t in strat_trades)
             s_wins = sum(1 for t in strat_trades if t.get("net_pnl", 0) > 0)
@@ -1564,40 +1299,19 @@ with tab_history:
 # TAB 4 — LIQUIDATIONS
 # ─────────────────────────────────────────────
 with tab_liquidation:
-    st.markdown("#### Guaranteed Liquidations & Resolutions")
-    st.markdown(
-        '<p style="color:#7d8590;font-size:0.8rem;font-family:\'JetBrains Mono\'">'
-        'Records of mispriced trades (flipped instantly to buyers) and Snipe trades (held to $1.00 or $0.00 resolution).</p>',
-        unsafe_allow_html=True
-    )
+    st.markdown("#### Guaranteed Liquidations & Verified API Resolutions")
+    st.markdown('<p style="color:#7d8590;font-size:0.8rem;font-family:\'JetBrains Mono\'">Records of mispriced trades (flipped instantly to buyers) and Snipe trades (held until the Polymarket API reports a 1 or 0 resolution).</p>', unsafe_allow_html=True)
 
-    if not st.session_state.liquidation_history:
-        st.markdown(
-            '<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No liquidations/resolutions executed yet.</p>',
-            unsafe_allow_html=True
-        )
+    if st.session_state.pending_trades:
+        st.markdown(f"**⏳ Pending Resolution ({len(st.session_state.pending_trades)})**")
+        pt_df = pd.DataFrame([{"Time": t.get("ts", ""), "Crypto": t.get("crypto", ""), "Token": t.get("token", ""), "Capital Locked": f"${t.get('cost_deducted', 0):.2f}", "Status": "Awaiting Oracle"} for t in st.session_state.pending_trades])
+        st.dataframe(pt_df, use_container_width=True, hide_index=True)
+
+    if not st.session_state.liquidation_history: st.markdown('<p style="color:#7d8590;font-family:\'JetBrains Mono\'">No liquidations/resolutions executed yet.</p>', unsafe_allow_html=True)
     else:
-        liq_df = pd.DataFrame([
-            {
-                "Time":        t.get("ts", ""),
-                "Strategy":    t.get("strategy", "").upper(),
-                "Crypto":      t.get("crypto", ""),
-                "Token":       t.get("token", ""),
-                "Shares":      f"{t.get('shares', 0):.2f}",
-                "Buy Price":   f"${t.get('buy_price', 0):.3f}",
-                "Sell Price":  f"${t.get('sell_price', 0):.3f}",
-                "Gross PnL":   f"${t.get('gross_pnl', 0):+.2f}",
-                "Net Profit":  f"${t.get('net_pnl', 0):+.2f}",
-            }
-            for t in reversed(st.session_state.liquidation_history[-100:])
-        ])
-        
-        def color_profit(val):
-            color = '#00ff88' if '+' in str(val) else '#ff4444' if '−' in str(val) or '-' in str(val) else '#e6edf3'
-            return f'color: {color}'
-            
-        styled_df = liq_df.style.applymap(color_profit, subset=['Gross PnL', 'Net Profit'])
-        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+        liq_df = pd.DataFrame([{"Time": t.get("ts", ""), "Strategy": t.get("strategy", "").upper(), "Crypto": t.get("crypto", ""), "Token": t.get("token", ""), "Shares": f"{t.get('shares', 0):.2f}", "Buy Price": f"${t.get('buy_price', 0):.3f}", "Sell Price": f"${t.get('sell_price', 0):.3f}", "Gross PnL": f"${t.get('gross_pnl', 0):+.2f}", "Net Profit": f"${t.get('net_pnl', 0):+.2f}"} for t in reversed(st.session_state.liquidation_history[-100:])])
+        def color_profit(val): return 'color: #00ff88' if '+' in str(val) else 'color: #ff4444' if '−' in str(val) or '-' in str(val) else 'color: #e6edf3'
+        st.dataframe(liq_df.style.applymap(color_profit, subset=['Gross PnL', 'Net Profit']), use_container_width=True, hide_index=True)
 
 
 # ─────────────────────────────────────────────
@@ -1608,63 +1322,25 @@ with tab_theory:
         """
         ## How the 5-Minute Crypto Bot Works
 
-        ### Market Structure
-
-        Polymarket creates a new **up-or-down** binary market for BTC, ETH, SOL, and XRP every
-        5 minutes.  Each market has exactly two outcomes:
-
-        | Token | Resolves to $1.00 if… | Resolves to $0.00 if… |
-        |-------|------------------------|------------------------|
-        | **YES** | crypto price is higher at close | crypto price is same or lower |
-        | **NO** | crypto price is same/lower at close | crypto price is higher |
-
-        ---
-
         ### Strategy 1 — Long Arbitrage
+        The $1.00 invariant: `1 YES + 1 NO = $1.00` at resolution. If you can buy both sides for less than $1.00 minus all costs, you lock in risk-free profit.
 
-        The $1.00 invariant: `1 YES + 1 NO = $1.00` at resolution.
-
-        If you can buy both sides for less than $1.00 minus all costs, you lock in risk-free profit:
-
-        ```
-        net_edge = 1.0 - (best_YES_ask + best_NO_ask) - total_fees
-        ```
-
-        ---
-
-        ### Strategy 2 — Last-15s Snipe (Probabilistic)
-
-        In the final 15 seconds, the outcome is highly probable.
-        The bot targets tokens priced > $0.70.
-        It simulates holding to resolution: A token priced at $0.85 has an 85% chance of returning $1.00, and a 15% chance of returning $0.00.
-        (Note: The simulator establishes one "true winner" per 5-minute period so outcomes are mathematically consistent).
-
-        ```
-        edge = 1.0 - best_ask_of_likely_winner - fees
-        ```
-
-        ---
+        ### Strategy 2 — Last-15s Snipe (Real API Verification)
+        In the final 15 seconds, the outcome is highly probable. The bot targets tokens priced > $0.70.
+        **Verification:** The bot deducts the cost from your bankroll, places the trade into a `PENDING` queue, and continuously polls the Polymarket API until the oracle officially closes the market and confirms the winning token. It then pays out exactly $1.00 or $0.00.
 
         ### Strategy 3 — Verified Mispriced Liquidation
-
         Scans the order book for an **ask** price dramatically below the cluster price, and simultaneously checks the **bids** to ensure there is a buyer waiting at a higher price.
-
-        1. Find Ask `A` where `A` is 50% cheaper than the cluster average.
-        2. Read the active Bids `[B1, B2, B3...]`.
-        3. Determine if `B1 > A + trade_fees`.
-        4. Buy shares from `A` strictly up to the limit of `B1`'s order volume, then instantly dump the shares to `B1` locking in profit.
+        The bot strictly limits its buy volume to exactly what it can instantly dump to existing buyers, locking in mathematical profit.
 
         ---
-
         ### Cost Model
-
         | Component | Value | Notes |
         |-----------|-------|-------|
         | CLOB fee | 0.075% per leg | Charged on each buy |
         | Gas/merge | $0.50 flat | On-chain bundle merge |
         | Swap spread | 0.02% | USDC↔USDC.e conversion |
         | Safety buffer | 10 bps | Slippage cushion |
-        | **Total** | ~0.3% + $0.50 | Scales with trade size |
         """
     )
 
@@ -1681,6 +1357,5 @@ elif not st.session_state.market_data:
     period_start = get_period_start()
     if period_start != st.session_state.current_period_start:
         st.session_state.current_period_start = period_start
-        with st.spinner("Loading market data…"):
-            refresh_market_data(period_start)
+        with st.spinner("Loading market data…"): refresh_market_data(period_start)
         st.rerun()
