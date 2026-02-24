@@ -2,7 +2,7 @@
 Polymarket 5-Minute Crypto Market Bot
 Monitors BTC/ETH/SOL/XRP up-or-down 5-minute markets with three strategies:
   1. Long Arbitrage  — buy YES + NO for total < 1.0 - fees
-  2. Last-15s Snipe  — buy highest-probability side and wait for REAL API ORACLE resolution
+  2. Last-15s Snipe  — buy highest-probability side in final 15 seconds (Consistent Probabilistic)
   3. Mispriced Order — find order-book outliers far below cluster price AND verify instant liquidation
 
 Public APIs only — no authentication, no live trading. Pure paper simulation.
@@ -310,6 +310,7 @@ DEFAULT_PARAMS = {
     # Thresholds
     "arb_threshold_bps": 20,        # min net edge for arb strategy (bps)
     "snipe_threshold":   0.05,      # min edge for last-15s snipe (per share)
+    "snipe_min_price":   0.70,      # min probability/price to target for snipe
     "mispriced_ratio":   0.50,      # ask must be ≤ this fraction of cluster to flag
     "mispriced_min_size":10.0,      # min order size to flag (USD)
     # Execution simulation
@@ -532,7 +533,8 @@ def fetch_orderbook(token_id: str) -> dict | None:
         asks = data.get("asks", data.get("sells", []))
         bids = data.get("bids", [])
         return {"asks": asks, "bids": bids}
-    except Exception:
+    except Exception as e:
+        log(f"[API] orderbook {token_id[:12]}…: {e}", "err")
         return None
 
 
@@ -555,8 +557,8 @@ def fetch_orderbooks_batch(token_ids: list[str]) -> dict[str, dict]:
                 result[tid] = {"asks": asks, "bids": bids}
             if result:
                 return result
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[API] batch orderbooks failed ({e}), falling back to individual GETs", "warn")
 
     result = {}
     for tid in token_ids:
@@ -645,14 +647,16 @@ def check_snipe_strategy(
 
     candidates = []
     fees = p["clob_fee_pct"] + p["gas_merge_usd"] / p["max_trade_usd"] + p["swap_spread_pct"] + p["buffer_bps"] / 10_000
+    
+    min_price = p.get("snipe_min_price", 0.70)
 
-    # Target tokens highly likely to win (priced > 70 cents)
-    if yes_ask is not None and yes_ask > 0.70:
+    # Target tokens highly likely to win (priced > min_price)
+    if yes_ask is not None and yes_ask > min_price:
         edge_yes = 1.0 - yes_ask - fees
         if edge_yes >= p["snipe_threshold"]:
             candidates.append({"token": "UP", "price": yes_ask, "edge": edge_yes, "confidence": yes_ask})
 
-    if no_ask is not None and no_ask > 0.70:
+    if no_ask is not None and no_ask > min_price:
         edge_no = 1.0 - no_ask - fees
         if edge_no >= p["snipe_threshold"]:
             candidates.append({"token": "DOWN", "price": no_ask, "edge": edge_no, "confidence": no_ask})
@@ -665,7 +669,7 @@ def check_snipe_strategy(
     return {
         "strategy":    "snipe",
         "crypto":      crypto,
-        "slug":        slug, # Pass the slug so we can poll the API later
+        "slug":        slug, 
         "token":       best["token"],
         "price":       best["price"],
         "edge":        best["edge"],
@@ -757,7 +761,7 @@ def simulate_trade(opp: dict, p: dict) -> dict:
     size = min(intended_size, p["max_trade_usd"], current_bankroll)
 
     if size < p["min_trade_usd"]:
-         return {"status": "rejected", "reason": f"Insufficient funds for min trade (Need ${p['min_trade_usd']:.2f}, Have ${current_bankroll:.2f})"}
+         return {"status": "rejected", "reason": f"Insufficient funds for min trade"}
 
     slip   = random.uniform(0, p["slippage_pct"] / 100)
     fill   = random.uniform(0.75, 1.0) 
@@ -785,7 +789,7 @@ def simulate_trade(opp: dict, p: dict) -> dict:
         st.session_state.bankroll -= total_cost_deduction
         
         return {
-            "status": "pending_resolution", # Put into holding pattern to wait for REAL API
+            "status": "pending_resolution", 
             "strategy": "snipe", "crypto": opp["crypto"], "slug": opp["slug"], "token": opp["token"],
             "size_usd": shares * cost, "shares": shares, "buy_price": cost, 
             "cost_deducted": total_cost_deduction, "edge_pct": opp["edge"] * 100,
@@ -1117,6 +1121,9 @@ with st.sidebar:
     st.markdown("---")
     st.session_state.refresh_interval = st.slider("Refresh interval (s)", 2, 30, int(st.session_state.refresh_interval), step=1)
     st.session_state.last_15s_window = st.slider("Snipe window (s before close)", 5, 30, int(st.session_state.last_15s_window), step=1)
+    
+    # ── NEW SLIDER HERE ──
+    st.session_state.snipe_min_price = st.slider("Snipe min price (> $X)", 0.50, 0.99, float(st.session_state.snipe_min_price), step=0.01)
 
     st.markdown("---")
     with st.expander("⚙ Cost Model"):
@@ -1326,7 +1333,7 @@ with tab_theory:
         The $1.00 invariant: `1 YES + 1 NO = $1.00` at resolution. If you can buy both sides for less than $1.00 minus all costs, you lock in risk-free profit.
 
         ### Strategy 2 — Last-15s Snipe (Real API Verification)
-        In the final 15 seconds, the outcome is highly probable. The bot targets tokens priced > $0.70.
+        In the final 15 seconds, the outcome is highly probable. The bot targets tokens priced above your set minimum (default > $0.70).
         **Verification:** The bot deducts the cost from your bankroll, places the trade into a `PENDING` queue, and continuously polls the Polymarket API until the oracle officially closes the market and confirms the winning token. It then pays out exactly $1.00 or $0.00.
 
         ### Strategy 3 — Verified Mispriced Liquidation
